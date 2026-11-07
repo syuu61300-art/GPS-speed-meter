@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<style>*{box-sizing:border-box}body{margin:0;font-size:14px}:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}[hidden]{display:none!important}</style>
 <title>GPS スピードメーター</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap">
@@ -15,12 +16,9 @@
   --f-mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
   color-scheme:dark;
 }
-*{box-sizing:border-box}
-html,body{height:100%;margin:0}
-body{background:var(--bg);color:var(--fg);font-family:var(--f-body);font-size:14px;
-  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font-family:var(--f-body);
   padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));}
-[hidden]{display:none!important}
 .wrap{max-width:560px;margin:0 auto;padding-block:16px 24px;display:flex;flex-direction:column;gap:16px}
 header{display:flex;justify-content:space-between;align-items:center;gap:12px}
 h1{font-family:var(--f-display);font-size:1rem;letter-spacing:.12em;font-weight:600;margin:0;text-transform:uppercase}
@@ -91,24 +89,23 @@ button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
     <button id="unitBtn">km/h ⇄ mph</button>
     <button id="demoBtn" aria-pressed="false">デモ走行</button>
   </div>
-  <p class="note">GPSの速度値を優先し、取れない端末では位置の変化から計算します。針は60fpsで補間して滑らかに動きます。GPS自体の更新は多くのスマホで毎秒1回前後です。平均は時速1.5km以上で動いている時間だけで計算します。</p>
+  <p class="note">GPSの速度値を優先し、取れない端末では位置の変化から計算します。メーターの目盛りは速度に合わせて最大400km/hまで広がります。トンネルなどで受信が途切れると「GPS待ち」と表示され、受信が戻ると再開します。</p>
 </div>
-
 <script>
 (() => {
 const $ = id => document.getElementById(id);
 const KMH = 3.6, MPH = 2.236936;
 let unitMph = false;
 try { unitMph = localStorage.getItem('unit') === 'mph'; } catch(e){}
-
 const S = { watchId:null, demoTimer:null, running:false, last:null, curMs:0, maxMs:0,
-  dist:0, movingTime:0, startT:null, history:[], fixTimes:[] };
+  dist:0, movingTime:0, startT:null, history:[], fixTimes:[], lastFixWall:null };
 let displayMs = 0;
-
 const conv = ms => ms * (unitMph ? MPH : KMH);
 const uname = () => unitMph ? 'mph' : 'km/h';
-const gaugeMax = () => unitMph ? 120 : 180;
-
+const SCALES_KMH=[[180,20],[240,30],[320,40],[400,50]], SCALES_MPH=[[120,10],[160,20],[200,20],[260,20]];
+function scale(){ const list=unitMph?SCALES_MPH:SCALES_KMH; const need=Math.max(conv(S.maxMs),conv(S.curMs))*1.05;
+  return list.find(s=>s[0]>=need)||list[list.length-1]; }
+const gaugeMax = () => scale()[0];
 function hav(a,b){
   const R=6371000, r=Math.PI/180;
   const dLat=(b.lat-a.lat)*r, dLon=(b.lon-a.lon)*r;
@@ -117,7 +114,6 @@ function hav(a,b){
 }
 function setStatus(kind, text){ $('dot').className='dot '+(kind||''); $('statusText').textContent=text; }
 function showMsg(text, err){ const m=$('msg'); m.textContent=text; m.className='msg'+(err?' err':''); m.hidden=!text; }
-
 function onFix(lat, lon, speedMs, accuracy, t){
   const p = {lat, lon, t};
   if (S.startT === null) S.startT = t;
@@ -140,6 +136,7 @@ function onFix(lat, lon, speedMs, accuracy, t){
   S.history.push({t, v});
   const cut = t - 120000;
   while (S.history.length && S.history[0].t < cut) S.history.shift();
+  S.lastFixWall = performance.now();
   S.fixTimes.push(performance.now());
   if (S.fixTimes.length > 10) S.fixTimes.shift();
   $('acc').textContent = accuracy ? `精度 ±${Math.round(accuracy)} m` : '精度 —';
@@ -165,13 +162,11 @@ function renderStats(){
     $('hz').textContent = `更新 ${((S.fixTimes.length-1)/span).toFixed(1)} Hz`;
   }
 }
-
 const gc = $('gauge'), tc = $('trace');
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 function fit(c){ const r=c.getBoundingClientRect(), d=window.devicePixelRatio||1;
   if (c.width!==Math.round(r.width*d)||c.height!==Math.round(r.height*d)){c.width=Math.round(r.width*d);c.height=Math.round(r.height*d);}
   const x=c.getContext('2d'); x.setTransform(d,0,0,d,0,0); return [x,r.width,r.height]; }
-
 const A0 = Math.PI*0.8, A1 = Math.PI*2.2;
 function drawGauge(){
   const [x,w,h] = fit(gc); x.clearRect(0,0,w,h);
@@ -183,7 +178,7 @@ function drawGauge(){
   const g=x.createLinearGradient(cx-R,0,cx+R,0);
   g.addColorStop(0,css('--cool')); g.addColorStop(.6,css('--accent')); g.addColorStop(1,css('--hot'));
   x.strokeStyle=g; x.beginPath(); x.arc(cx,cy,R,A0,ang(val)+0.0001); x.stroke();
-  const step = unitMph ? 10 : 20;
+  const step = scale()[1];
   x.font=`500 ${Math.max(10,R*0.075)}px "JetBrains Mono", monospace`; x.textAlign='center'; x.textBaseline='middle';
   for (let v=0; v<=mx; v+=step/2){
     const a=ang(v), major = v%step===0;
@@ -213,22 +208,24 @@ function drawTrace(){
   x.strokeStyle=css('--accent'); x.lineWidth=2; x.stroke();
   const e=pts[pts.length-1]; x.fillStyle=css('--accent'); x.beginPath(); x.arc(X(e.t),Y(e.v),3.5,0,Math.PI*2); x.fill();
 }
-
 let lastFrame = performance.now();
 function frame(now){
   const dt=(now-lastFrame)/1000; lastFrame=now;
   displayMs += (S.curMs - displayMs) * (1 - Math.exp(-dt*6));
   $('speed').textContent = Math.round(conv(displayMs));
   if (S.running && S.startT){ $('time').textContent=fmtTime((Date.now()-S.startT)/1000); }
+  if (S.watchId!==null && S.lastFixWall){
+    const gap=(now-S.lastFixWall)/1000;
+    if (gap>4) setStatus('warn',`GPS待ち ${Math.floor(gap)}秒（トンネル?）`);
+    else setStatus('ok','GPS受信中');
+  }
   drawGauge(); drawTrace();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-
 let wake=null;
 async function keepAwake(){ try{ if('wakeLock' in navigator){ wake=await navigator.wakeLock.request('screen'); } }catch(e){} }
 document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && S.running) keepAwake(); });
-
 function stopAll(){
   if (S.watchId!==null && navigator.geolocation) navigator.geolocation.clearWatch(S.watchId);
   S.watchId=null; clearInterval(S.demoTimer); S.demoTimer=null; S.running=false;
@@ -242,35 +239,33 @@ function startGPS(){
   keepAwake();
   try{
     S.watchId = navigator.geolocation.watchPosition(pos=>{
-      const c=pos.coords; setStatus('ok','GPS受信中');
+      const c=pos.coords; showMsg('');
       onFix(c.latitude,c.longitude,c.speed,c.accuracy,pos.timestamp||Date.now());
     }, err=>{
       const why = err.code===1 ? '位置情報の利用が許可されていません。ブラウザの設定で許可してください。'
-        : err.code===2 ? '位置を取得できません。屋外や窓の近くで試してください。'
-        : 'GPSの応答がタイムアウトしました。';
-      setStatus('err','エラー'); showMsg(why,true);
-      if (err.code===1) stopAll();
-    }, {enableHighAccuracy:true, maximumAge:0, timeout:15000});
+        : err.code===2 ? '位置を取得できません。窓際にスマホを近づけてください。'
+        : '';
+      if (err.code===1){ setStatus('err','エラー'); showMsg(why,true); stopAll(); }
+      else if (why) showMsg(why,false);
+    }, {enableHighAccuracy:true, maximumAge:0, timeout:60000});
   }catch(e){ setStatus('err','エラー'); showMsg('位置情報を開始できませんでした。',true); stopAll(); }
 }
 function startDemo(){
   stopAll(); S.running=true; $('demoBtn').setAttribute('aria-pressed','true'); $('startBtn').textContent='停止';
   setStatus('warn','デモ走行中'); showMsg('デモの値です。実際の速度ではありません。');
-  let lat=34.9756, lon=138.3828, t=Date.now(), phase=0;
+  let lat=34.9756, lon=138.3828, t=Date.now(), phase=-1.4;
   S.demoTimer=setInterval(()=>{
     phase+=0.05; t+=1000;
-    const kmh=Math.max(0, 45+35*Math.sin(phase)+12*Math.sin(phase*3.1)+(Math.random()-.5)*4);
+    const kmh=Math.max(0, 140+140*Math.sin(phase)+(Math.random()-.5)*4);
     const ms=kmh/3.6; lon += ms/(111320*Math.cos(lat*Math.PI/180));
     onFix(lat,lon,ms,5,t);
   },1000);
 }
-
 $('startBtn').onclick=()=>{ S.running ? (stopAll(), setStatus('','停止中')) : startGPS(); };
 $('demoBtn').onclick=()=>{ S.demoTimer ? (stopAll(), setStatus('','停止中'), showMsg('')) : startDemo(); };
-$('resetBtn').onclick=()=>{ Object.assign(S,{last:null,curMs:0,maxMs:0,dist:0,movingTime:0,startT:null,history:[],fixTimes:[]});
+$('resetBtn').onclick=()=>{ Object.assign(S,{lastFixWall:null,last:null,curMs:0,maxMs:0,dist:0,movingTime:0,startT:null,history:[],fixTimes:[]});
   displayMs=0; $('time').textContent='00:00:00'; $('hz').textContent='更新 — Hz'; $('acc').textContent='精度 —'; renderStats(); };
 $('unitBtn').onclick=()=>{ unitMph=!unitMph; try{localStorage.setItem('unit',unitMph?'mph':'kmh');}catch(e){} renderStats(); };
-
 renderStats();
 })();
 </script>
