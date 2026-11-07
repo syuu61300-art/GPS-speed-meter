@@ -62,7 +62,18 @@ button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 .msg{font-size:.8rem;line-height:1.6;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);margin:0}
 .msg.err{border-color:var(--hot)}
 .msg.good{border-color:var(--cool)}
-@media (prefers-reduced-motion:reduce){.dot.pred{animation:none}}
+/* 超ミニマップ（画面右下に固定、タップで拡大） */
+.wrap{padding-bottom:120px}
+.minimap{position:fixed;z-index:20;right:calc(12px + env(safe-area-inset-right,0px));bottom:calc(12px + env(safe-area-inset-bottom,0px));
+  width:92px;height:92px;border-radius:14px;overflow:hidden;border:1px solid var(--line);background:var(--panel);
+  box-shadow:0 6px 20px rgba(0,0,0,.45);cursor:pointer;transition:width .2s,height .2s}
+.minimap.big{width:min(300px,calc(100vw - 32px));height:min(300px,calc(100vw - 32px))}
+.minimap.pred{border-color:var(--pred)}
+.minimap canvas{width:100%;height:100%;display:block}
+.minimap:focus-visible{outline:2px solid var(--cool);outline-offset:2px}
+.minimap .attr{position:absolute;left:0;right:0;bottom:0;font-size:8px;line-height:1.4;padding:1px 4px;color:var(--dim);background:rgba(13,16,20,.7);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.minimap .mtag{position:absolute;top:4px;left:4px;font-size:9px;font-weight:700;color:var(--bg);background:var(--pred);border-radius:3px;padding:0 4px}
+@media (prefers-reduced-motion:reduce){.dot.pred{animation:none}.minimap{transition:none}}
 </style>
 </head>
 <body>
@@ -102,7 +113,12 @@ button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
     <button id="unitBtn">km/h ⇄ mph</button>
     <button id="demoBtn" aria-pressed="false">デモ走行</button>
   </div>
-  <p class="note">GPSが3秒以上途切れると、直前の速度と加速の傾向から速度と距離を予測します（紫色）。GPSが戻ると自動で実測に切り替わり、トンネル区間の距離は出口の位置から計算し直します。最高速度は実測値だけで記録します。</p>
+  <p class="note">GPSが3秒以上途切れると、直前の速度と加速の傾向から速度と距離を予測します（紫色）。GPSが戻ると自動で実測に切り替わり、トンネル区間の距離は出口の位置から計算し直します。最高速度は実測値だけで記録します。右下のミニマップは予測中も推定位置で動き続けます（タップで拡大）。</p>
+</div>
+<div class="minimap" id="minimap" role="button" tabindex="0" aria-label="ミニマップ（タップで拡大）" aria-expanded="false">
+  <canvas id="mapCanvas"></canvas>
+  <span class="mtag" id="mapTag" hidden>予測位置</span>
+  <span class="attr" id="mapAttr">© OpenStreetMap</span>
 </div>
 <script>
 (() => {
@@ -116,7 +132,7 @@ try { unitMph = localStorage.getItem('unit') === 'mph'; } catch(e){}
 
 const S = { watchId:null, demoTimer:null, running:false, last:null, curMs:0, maxMs:0,
   dist:0, predDist:0, movingTime:0, startT:null, history:[], fixTimes:[], lastFixWall:null,
-  predicting:false, pred:null, tunnels:0, lastRestart:0, lastPredPush:0 };
+  predicting:false, pred:null, tunnels:0, lastRestart:0, lastPredPush:0, heading:null, track:[] };
 let displayMs = 0;
 
 const conv = ms => ms * (unitMph ? MPH : KMH);
@@ -169,7 +185,7 @@ function endPrediction(){
 }
 
 // ---------- 実測の受信 ----------
-function onFix(lat, lon, speedMs, accuracy, t){
+function onFix(lat, lon, speedMs, accuracy, t, headingDeg){
   const nowWall = performance.now();
   const wasPredicting = S.predicting;
   const gapSec = S.lastFixWall ? (nowWall - S.lastFixWall)/1000 : 0;
@@ -185,8 +201,13 @@ function onFix(lat, lon, speedMs, accuracy, t){
       // トンネル区間は入口〜出口の位置から実距離を確定（予測距離は破棄）
       if (ok && d/dt < 120) S.dist += d;
       if (d/dt > 0.42) S.movingTime += dt;
+      // 進行方向：GPSの方位を優先、なければ前回位置からの方位
+      if (typeof headingDeg === 'number' && !isNaN(headingDeg) && (v||0) > 1) S.heading = headingDeg;
+      else if (d > 8) S.heading = bearing(S.last, p);
     }
   }
+  S.track.push({lat, lon, gap:wasPredicting});
+  if (S.track.length > 3000) S.track.shift();
   S.predDist = 0;
   if (v === null) v = 0;
   if (v < 0.25) v = 0;
@@ -199,6 +220,7 @@ function onFix(lat, lon, speedMs, accuracy, t){
   S.fixTimes.push(nowWall);
   if (S.fixTimes.length > 10) S.fixTimes.shift();
   $('acc').textContent = accuracy ? `精度 ±${Math.round(accuracy)} m` : '精度 —';
+  prefetchTiles();
   if (wasPredicting){
     endPrediction();
     S.fixTimes = [nowWall];
@@ -286,6 +308,92 @@ function drawTrace(){
   const e=pts[pts.length-1]; x.fillStyle= e.pred?css('--pred'):css('--accent'); x.beginPath(); x.arc(X(e.t),Y(e.v),3.5,0,Math.PI*2); x.fill();
 }
 
+// ---------- 超ミニマップ ----------
+const mm = $('minimap'), mc = $('mapCanvas');
+let mapBig = false;
+function toggleMap(){ mapBig=!mapBig; mm.classList.toggle('big',mapBig); mm.setAttribute('aria-expanded',String(mapBig));
+  $('mapAttr').textContent = mapBig ? '© OpenStreetMap contributors' : '© OpenStreetMap'; }
+mm.addEventListener('click', toggleMap);
+mm.addEventListener('keydown', e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); toggleMap(); } });
+
+const tiles = new Map();
+function tile(z,x,y){
+  const n=2**z; x=((x%n)+n)%n; if (y<0||y>=n) return null;
+  const k=z+'/'+x+'/'+y; let t=tiles.get(k);
+  if (!t){
+    const img=new Image(); t={img, ok:false};
+    img.onload=()=>{ t.ok=true; };
+    img.onerror=()=>{ setTimeout(()=>tiles.delete(k), 15000); }; // 圏外なら後で再試行
+    img.src=`https://tile.openstreetmap.org/${k}.png`;
+    tiles.set(k,t);
+    if (tiles.size>400) tiles.delete(tiles.keys().next().value);
+  }
+  return t;
+}
+function proj(lat,lon,z){ const s=256*2**z, r=lat*Math.PI/180;
+  return {x:(lon+180)/360*s, y:(1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*s}; }
+function movePos(p,dist,hdg){ const r=hdg*Math.PI/180;
+  return {lat:p.lat+dist*Math.cos(r)/111320, lon:p.lon+dist*Math.sin(r)/(111320*Math.cos(p.lat*Math.PI/180))}; }
+function bearing(a,b){ const r=Math.PI/180;
+  const y=Math.sin((b.lon-a.lon)*r)*Math.cos(b.lat*r);
+  const x=Math.cos(a.lat*r)*Math.sin(b.lat*r)-Math.sin(a.lat*r)*Math.cos(b.lat*r)*Math.cos((b.lon-a.lon)*r);
+  return (Math.atan2(y,x)/r+360)%360; }
+// 表示位置：GPS受信中は最後の位置から速度×経過時間で滑らかに進め、予測中は予測距離ぶん進める
+function currentPos(now){
+  if (!S.last) return null;
+  if (S.heading==null) return {lat:S.last.lat, lon:S.last.lon};
+  const extra = S.predicting ? S.predDist : Math.min(1.2,(now-S.lastFixWall)/1000)*S.curMs;
+  return movePos(S.last, extra, S.heading);
+}
+// 圏外になる前に、進行方向の先の地図を読み込んでおく
+function prefetchTiles(){
+  if (!S.last || S.heading==null) return;
+  [13,14].forEach(z=>{ for (const d of [0,1500,3000,5000,8000]){
+    const p=movePos(S.last,d,S.heading), q=proj(p.lat,p.lon,z); tile(z,Math.floor(q.x/256),Math.floor(q.y/256)); } });
+}
+const canFilter = (()=>{ try{ const c=document.createElement('canvas').getContext('2d'); return !!c && 'filter' in c; }catch(e){ return false; } })();
+function drawMap(now){
+  const [x,w,h]=fit(mc);
+  x.fillStyle=css('--panel'); x.fillRect(0,0,w,h);
+  mm.classList.toggle('pred', S.predicting); $('mapTag').hidden = !S.predicting;
+  const pos=currentPos(now);
+  if (!pos){
+    x.fillStyle=css('--dim'); x.font='10px "Noto Sans JP", sans-serif'; x.textAlign='center'; x.textBaseline='middle';
+    x.fillText('現在地待ち', w/2, h/2-4); return;
+  }
+  const z = mapBig ? 14 : 13;
+  const c=proj(pos.lat,pos.lon,z), ox=c.x-w/2, oy=c.y-h/2;
+  // 地図が読めないとき用の方眼（移動が見えるよう地図座標に固定）
+  x.strokeStyle=css('--line'); x.lineWidth=1; const g=24;
+  for (let gx=-(((ox%g)+g)%g); gx<w; gx+=g){ x.beginPath(); x.moveTo(gx,0); x.lineTo(gx,h); x.stroke(); }
+  for (let gy=-(((oy%g)+g)%g); gy<h; gy+=g){ x.beginPath(); x.moveTo(0,gy); x.lineTo(w,gy); x.stroke(); }
+  // 地図タイル（ダークに変換）
+  if (canFilter) x.filter='invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.5)'; else x.globalAlpha=.5;
+  for (let ty=Math.floor(oy/256); ty<=Math.floor((oy+h)/256); ty++)
+    for (let tx=Math.floor(ox/256); tx<=Math.floor((ox+w)/256); tx++){
+      const t=tile(z,tx,ty); if (t && t.ok) x.drawImage(t.img, tx*256-ox, ty*256-oy, 256, 256); }
+  x.filter='none'; x.globalAlpha=1;
+  // 走行軌跡（実測＝橙、トンネル区間＝紫の点線）
+  const P=p=>{ const q=proj(p.lat,p.lon,z); return [q.x-ox, q.y-oy]; };
+  const tr=S.track.slice(-800);
+  x.lineWidth=2.5; x.lineCap='round'; x.lineJoin='round';
+  for (let i=1;i<tr.length;i++){
+    const a=P(tr[i-1]), b=P(tr[i]);
+    if ((a[0]<-50&&b[0]<-50)||(a[0]>w+50&&b[0]>w+50)||(a[1]<-50&&b[1]<-50)||(a[1]>h+50&&b[1]>h+50)) continue;
+    x.strokeStyle = tr[i].gap ? css('--pred') : css('--accent'); x.setLineDash(tr[i].gap?[3,3]:[]);
+    x.beginPath(); x.moveTo(a[0],a[1]); x.lineTo(b[0],b[1]); x.stroke();
+  }
+  if (S.predicting){ const a=P(S.last); x.strokeStyle=css('--pred'); x.setLineDash([3,3]);
+    x.beginPath(); x.moveTo(a[0],a[1]); x.lineTo(w/2,h/2); x.stroke(); }
+  x.setLineDash([]);
+  // 現在地マーカー（北が上、矢印は進行方向）
+  x.save(); x.translate(w/2,h/2);
+  x.fillStyle = S.predicting ? css('--pred') : css('--cool'); x.strokeStyle=css('--bg'); x.lineWidth=2;
+  if (S.heading==null){ x.beginPath(); x.arc(0,0,5,0,Math.PI*2); x.fill(); x.stroke(); }
+  else { x.rotate(S.heading*Math.PI/180); x.beginPath(); x.moveTo(0,-9); x.lineTo(6.5,7); x.lineTo(0,3.5); x.lineTo(-6.5,7); x.closePath(); x.fill(); x.stroke(); }
+  x.restore();
+}
+
 // ---------- メインループ（60fps） ----------
 let lastFrame = performance.now();
 function frame(now){
@@ -317,7 +425,7 @@ function frame(now){
   displayMs += (S.curMs - displayMs) * (1 - Math.exp(-dt*6));
   $('speed').textContent = Math.round(conv(displayMs));
   if (S.running && S.startT){ $('time').textContent=fmtTime((Date.now()-S.startT)/1000); }
-  drawGauge(); drawTrace();
+  drawGauge(); drawTrace(); drawMap(now);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -339,7 +447,7 @@ function onGeoError(err){
 function watch(){
   return navigator.geolocation.watchPosition(pos=>{
     const c=pos.coords;
-    onFix(c.latitude,c.longitude,c.speed,c.accuracy,pos.timestamp||Date.now());
+    onFix(c.latitude,c.longitude,c.speed,c.accuracy,pos.timestamp||Date.now(),c.heading);
   }, onGeoError, {enableHighAccuracy:true, maximumAge:0, timeout:30000});
 }
 function restartWatch(){
@@ -365,13 +473,14 @@ function startGPS(){
 function startDemo(){
   stopAll(); S.running=true; $('demoBtn').setAttribute('aria-pressed','true'); $('startBtn').textContent='停止';
   showMsg('デモの値です。35秒ごとに12秒間のトンネルを再現します。');
-  let lat=34.9756, lon=138.3828, t=Date.now(), k=0;
+  let pos={lat:35.6812, lon:139.7671}, t=Date.now(), k=0;
   S.demoTimer=setInterval(()=>{
     k++; t+=1000;
     const kmh = Math.min(285, 60 + k*6) + Math.sin(k/7)*6 + (Math.random()-.5)*3;
-    const ms=kmh/3.6; lon += ms/(111320*Math.cos(lat*Math.PI/180));
+    const ms=kmh/3.6, hdg = 225 + 30*Math.sin(k/25);
+    pos = movePos(pos, ms, hdg);
     const inTunnel = (k % 47) >= 35;
-    if (!inTunnel) onFix(lat,lon,ms,5,t);
+    if (!inTunnel) onFix(pos.lat,pos.lon,ms,5,t,hdg);
   },1000);
 }
 
@@ -379,7 +488,7 @@ $('startBtn').onclick=()=>{ S.running ? (stopAll(), setStatus('','停止中')) :
 $('demoBtn').onclick=()=>{ S.demoTimer ? (stopAll(), setStatus('','停止中'), showMsg('')) : startDemo(); };
 $('resetBtn').onclick=()=>{
   endPrediction();
-  Object.assign(S,{lastFixWall:null,last:null,curMs:0,maxMs:0,dist:0,predDist:0,movingTime:0,startT:null,history:[],fixTimes:[],tunnels:0});
+  Object.assign(S,{lastFixWall:null,last:null,curMs:0,maxMs:0,dist:0,predDist:0,movingTime:0,startT:null,history:[],fixTimes:[],tunnels:0,heading:null,track:[]});
   displayMs=0; $('time').textContent='00:00:00'; $('hz').textContent='更新 — Hz'; $('acc').textContent='精度 —'; showMsg(''); renderStats(); };
 $('unitBtn').onclick=()=>{ unitMph=!unitMph; try{localStorage.setItem('unit',unitMph?'mph':'kmh');}catch(e){} renderStats(); };
 renderStats();
